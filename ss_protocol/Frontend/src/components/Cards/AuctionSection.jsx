@@ -19,9 +19,9 @@ import { chainCurrencyMap } from "../../../WalletConfig";
 import useTokenBalances from "../Swap/UserTokenBalances";
 import { useAllTokens } from "../Swap/Tokens";
 import { ContractContext } from "../../Functions/ContractInitialize";
-import { notifyError, PULSEX_ROUTER_ADDRESS, PULSEX_ROUTER_ABI } from "../../Constants/Constants";
-import { calculatePlsValueNumeric, formatNumber, formatWithCommas, calculateAmmPlsValueNumeric, calculateStateAmmPlsValueNumeric } from "../../Constants/Utils";
-import { getCachedContract } from "../../utils/contractCache";
+import { notifyError } from "../../Constants/Constants";
+import { calculatePlsValueNumeric, formatNumber, formatWithCommas } from "../../Constants/Utils";
+import { calculateAmmValuesAsync } from "../../utils/workerManager";
 // Optimized: Use Zustand stores for selective subscriptions
 import { useTokenStore } from "../../stores";
 
@@ -68,22 +68,8 @@ const AuctionSection = () => {
     const [copiedCode, setCopiedCode] = useState("");
     const AuthAddress = import.meta.env.VITE_AUTH_ADDRESS;
     const [isGov, setIsGov] = useState(false);
-    const [ammEstimatedPls, setAmmEstimatedPls] = useState(0);
-
-    // Initialize router contract for AMM calculations
-    const routerContract = useMemo(() => {
-        if (!signer || chainId !== 369) return null;
-        try {
-            return getCachedContract(
-                PULSEX_ROUTER_ADDRESS,
-                PULSEX_ROUTER_ABI,
-                signer.provider
-            );
-        } catch (error) {
-            console.error('Error initializing router contract:', error);
-            return null;
-        }
-    }, [signer, chainId]);
+    // Worker-based AMM estimate (null = not calculated yet)
+    const [ammEstimatedPls, setAmmEstimatedPls] = useState(null);
 
     useEffect(() => {
         let cancelled = false;
@@ -182,43 +168,83 @@ const AuctionSection = () => {
         return tokensPls + statePls;
     };
 
-    // AMM-based calculation using actual DEX prices
+    // AMM-based calculation using the Web Worker (keeps UI thread light)
+    // Per your request: add claimable rewards into this DAV page calculation only.
     useEffect(() => {
-        let mounted = true;
-        const calculateAmmTotal = async () => {
-            if (!routerContract || !TOKENS || !tokenBalances || !tokens.length) {
-                return;
-            }
+        let cancelled = false;
+
+        const parseNumber = (v) => {
+            const n = Number(v);
+            return Number.isFinite(n) ? n : 0;
+        };
+
+        const parseCommaNumber = (s) => {
+            if (s === null || s === undefined) return 0;
+            const cleaned = String(s).replace(/,/g, "");
+            return parseNumber(cleaned);
+        };
+
+        const run = async () => {
+            if (chainId !== 369) return;
+            if (!tokens?.length || !tokenBalances) return;
 
             try {
-                // Calculate sum of all auction tokens using AMM
-                const tokenPromises = tokens.map(token => 
-                    calculateAmmPlsValueNumeric(token, tokenBalances, routerContract, TOKENS, chainId)
-                );
-                const tokenValues = await Promise.all(tokenPromises);
-                const tokensPls = tokenValues.reduce((sum, val) => sum + val, 0);
-
-                // Add STATE holdings converted via AMM
-                const stateBalRaw = tokenBalances?.["STATE"];
-                const statePls = await calculateStateAmmPlsValueNumeric(stateBalRaw, routerContract, TOKENS, chainId);
-
-                const total = tokensPls + statePls;
-                if (mounted) {
-                    setAmmEstimatedPls(total);
+                // Ensure STATE balance is present for worker (use on-chain stateHolding as source of truth)
+                const effectiveBalances = { ...(tokenBalances || {}) };
+                const stateHoldNum = parseNumber(stateHolding);
+                if (stateHoldNum > 0) {
+                    effectiveBalances["STATE"] = String(stateHolding);
                 }
+
+                // IMPORTANT: Worker has fallback hardcoded addresses; override them with app-configured ones.
+                const stateAddressRaw = TOKENS?.["STATE"]?.address;
+                let wrappedNativeKey = "Wrapped Pulse";
+                if (chainId === 146) wrappedNativeKey = "Wrapped Sonic";
+                else if (chainId === 137) wrappedNativeKey = "Wrapped Matic";
+                else if (chainId === 1) wrappedNativeKey = "Wrapped Ether";
+
+                let wplsAddressRaw = TOKENS?.[wrappedNativeKey]?.address;
+                if (!wplsAddressRaw) {
+                    const wplsEntry = Object.values(TOKENS || {}).find(t => t?.symbol === 'WPLS');
+                    wplsAddressRaw = wplsEntry?.address;
+                }
+
+                // Reduce worker load: only send tokens with a non-zero balance (plus DAV/STATE)
+                const filteredTokens = tokens.filter(t => {
+                    const name = t?.tokenName;
+                    if (!name) return false;
+                    if (name === 'DAV' || name === 'STATE') return true;
+                    return parseNumber(effectiveBalances?.[name]) > 0;
+                });
+
+                const { totalSum } = await calculateAmmValuesAsync(
+                    filteredTokens,
+                    effectiveBalances,
+                    {
+                        onlyTotal: true,
+                        stateAddress: stateAddressRaw,
+                        wplsAddress: wplsAddressRaw,
+                    }
+                );
+                const portfolioPls = parseCommaNumber(totalSum);
+                const claimablePls = parseNumber(claimableAmount);
+                const total = portfolioPls + claimablePls;
+
+                if (!cancelled) setAmmEstimatedPls(total);
             } catch (error) {
-                console.error('Error calculating AMM total:', error);
-                // Fallback to ratio-based calculation
-                if (mounted) {
+                console.error('Worker AMM total error:', error);
+                // Fallback to ratio-based calculation (+ claimable)
+                if (!cancelled) {
                     const fallback = calculateTotalSum();
-                    setAmmEstimatedPls(fallback);
+                    const claimablePls = parseNumber(claimableAmount);
+                    setAmmEstimatedPls(fallback + claimablePls);
                 }
             }
         };
 
-        calculateAmmTotal();
-        return () => { mounted = false; };
-    }, [tokens, tokenBalances, routerContract, TOKENS, chainId]);
+        run();
+        return () => { cancelled = true; };
+    }, [chainId, tokens, tokenBalances, claimableAmount, stateHolding]);
 
     const handleOptionalInputChange = (e) => {
         setReferralAmount(e.target.value);
@@ -230,10 +256,8 @@ const AuctionSection = () => {
 
     // Use AMM-calculated value instead of on-chain ratio-based value
     const estimatedPlsValue = useMemo(() => {
-        // Use AMM calculation if available
-        if (ammEstimatedPls > 0) {
-            return ammEstimatedPls;
-        }
+        // Use worker AMM calculation when available (0 is a valid value)
+        if (ammEstimatedPls !== null) return ammEstimatedPls;
         // Fallback to on-chain value if AMM not ready
         const v = Number.parseFloat(roiTotalValuePls || 0);
         if (Number.isFinite(v) && v >= 0) return v;

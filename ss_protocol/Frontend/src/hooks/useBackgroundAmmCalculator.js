@@ -26,7 +26,7 @@ const PULSEX_ROUTER_ABI = [
 const RPC_URL = 'https://pulsechain-rpc.publicnode.com';
 
 // Cache key and TTL
-const AMM_CACHE_KEY = 'ammValuesCache_v2';
+const AMM_CACHE_KEY = 'ammValuesCache_v3';
 const AMM_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 const REFRESH_INTERVAL = 30 * 1000; // 30 seconds between background updates
 
@@ -60,6 +60,35 @@ function formatWithCommas(num) {
   const n = Number(num);
   if (!Number.isFinite(n)) return '0';
   return n.toLocaleString('en-US', { maximumFractionDigits: 0 });
+}
+
+// Format a 18-decimal wei BigInt into an integer string with commas.
+function formatWeiToIntegerWithCommas(wei) {
+  try {
+    if (wei === 0n) return '0';
+    const full = ethers.formatEther(wei);
+    const intPart = full.split('.')[0] || '0';
+    return intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  } catch {
+    return '0';
+  }
+}
+
+function formatWeiToDisplay(wei) {
+  try {
+    if (wei === 0n) return '0';
+    const full = ethers.formatEther(wei);
+    const [intPart, decPart = ''] = full.split('.');
+    const intNum = intPart || '0';
+    if (intNum !== '0') {
+      return intNum.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+    }
+    // < 1: show 4 decimals like previous UI
+    const dec4 = (decPart + '0000').slice(0, 4);
+    return `0.${dec4}`;
+  } catch {
+    return '0';
+  }
 }
 
 export function useBackgroundAmmCalculator(sortedTokens, tokenBalances, chainId, TOKENS) {
@@ -157,11 +186,11 @@ export function useBackgroundAmmCalculator(sortedTokens, tokenBalances, chainId,
     }
   }, []);
 
-  // Calculate auction token value using two-step routing: TOKEN → STATE → WPLS
-  // This matches the pattern in Utils.js calculateAmmPlsValueBoth
-  const calculateAuctionTokenPlsValue = useCallback(async (tokenName, balance, decimals = 18) => {
+  // Calculate TOKEN -> STATE output (wei). We later allocate portfolio PLS across tokens
+  // so that per-token displays sum exactly to the total.
+  const calculateTokenStateWei = useCallback(async (tokenName, balance, decimals = 18) => {
     if (!balance || balance === '0' || balance === 0) {
-      return { numeric: 0, display: '0' };
+      return 0n;
     }
     
     // Get addresses from TOKENS object (same as Utils.js)
@@ -169,83 +198,32 @@ export function useBackgroundAmmCalculator(sortedTokens, tokenBalances, chainId,
     const { stateAddress, wplsAddress } = getTokensAddresses();
     
     if (!tokenAddress || !stateAddress || !wplsAddress) {
-      return { numeric: 0, display: '0' };
+      return 0n;
     }
     
     try {
       const router = getRouter();
       const balanceWei = safeParseBalance(balance, decimals);
       if (balanceWei === 0n) {
-        return { numeric: 0, display: '0' };
+        return 0n;
       }
       
       // Ensure proper checksum addresses
       const checksumToken = toChecksumAddress(tokenAddress);
       const checksumState = toChecksumAddress(stateAddress);
-      const checksumWpls = toChecksumAddress(wplsAddress);
       
-      // Two-step routing (same as Utils.js):
       // Step 1: TOKEN → STATE
       const path1 = [checksumToken, checksumState];
       const amounts1 = await router.getAmountsOut(balanceWei, path1);
       const stateAmountWei = amounts1[amounts1.length - 1];
       
-      if (stateAmountWei === 0n) {
-        return { numeric: 0, display: '0' };
-      }
-      
-      // Step 2: STATE → WPLS
-      const path2 = [checksumState, checksumWpls];
-      const amounts2 = await router.getAmountsOut(stateAmountWei, path2);
-      const plsAmountWei = amounts2[amounts2.length - 1];
-      
-      const numericValue = Number(ethers.formatEther(plsAmountWei));
-      
-      const displayValue = numericValue >= 1 
-        ? Math.floor(numericValue).toLocaleString()
-        : numericValue.toFixed(4);
-      
-      return { numeric: numericValue, display: displayValue };
+      return stateAmountWei || 0n;
     } catch {
-      return { numeric: 0, display: '0' };
+      return 0n;
     }
   }, [TOKENS, getTokensAddresses, getRouter, safeParseBalance, toChecksumAddress]);
   
-  // Calculate STATE value: STATE → WPLS direct
-  const calculateStatePlsValue = useCallback(async (stateBalance) => {
-    if (!stateBalance || stateBalance === '0' || stateBalance === 0) {
-      return { numeric: 0, display: '0' };
-    }
-    
-    const { stateAddress, wplsAddress } = getTokensAddresses();
-    
-    if (!stateAddress || !wplsAddress) {
-      return { numeric: 0, display: '0' };
-    }
-    
-    try {
-      const router = getRouter();
-      const balanceWei = safeParseBalance(stateBalance);
-      if (balanceWei === 0n) return { numeric: 0, display: '0' };
-      
-      const checksumState = toChecksumAddress(stateAddress);
-      const checksumWpls = toChecksumAddress(wplsAddress);
-      
-      const path = [checksumState, checksumWpls];
-      const amounts = await router.getAmountsOut(balanceWei, path);
-      const plsAmount = amounts[amounts.length - 1];
-      
-      const numericValue = Number(ethers.formatEther(plsAmount));
-      
-      const displayValue = numericValue >= 1 
-        ? Math.floor(numericValue).toLocaleString()
-        : numericValue.toFixed(4);
-      
-      return { numeric: numericValue, display: displayValue };
-    } catch {
-      return { numeric: 0, display: '0' };
-    }
-  }, [getTokensAddresses, getRouter, safeParseBalance, toChecksumAddress]);
+  const parseStateWei = useCallback((stateBalance) => safeParseBalance(stateBalance, 18), [safeParseBalance]);
   
   // Background calculation with UI-safe batching and memory protection
   const runBackgroundCalculation = useCallback(async () => {
@@ -266,57 +244,32 @@ export function useBackgroundAmmCalculator(sortedTokens, tokenBalances, chainId,
     const startTime = performance.now();
     
     try {
-      const results = {};
-      let totalPls = 0;
-      
-      // Process in concurrent batches of 5 with micro-yields between batches
-      // This balances speed with UI responsiveness
-      const BATCH_SIZE = 5;
-      
-      for (let i = 0; i < sortedTokens.length; i += BATCH_SIZE) {
-        // Check if superseded or unmounted - abort early to prevent memory leaks
-        if (!mountedRef.current || calcId !== calculationIdRef.current) {
-          isCalculatingRef.current = false;
-          return;
+      const stateWeiByToken = {};
+      let totalStateWei = 0n;
+
+      // Compute STATE contribution for each token (TOKEN -> STATE). One quote per token.
+      const perToken = await Promise.all(sortedTokens.map(async (token) => {
+        const tokenName = token.tokenName;
+        const balance = tokenBalances?.[tokenName];
+        const decimals = TOKENS?.[tokenName]?.decimals ?? 18;
+
+        if (tokenName === 'DAV') return { tokenName, stateWei: 0n };
+
+        if (tokenName === 'STATE') {
+          const stateWei = parseStateWei(balance);
+          return { tokenName, stateWei };
         }
-        
-        const batch = sortedTokens.slice(i, i + BATCH_SIZE);
-        
-        // Process batch in parallel (fast)
-        const batchPromises = batch.map(async (token) => {
-          const tokenName = token.tokenName;
-          const balance = tokenBalances?.[tokenName];
-          const decimals = TOKENS?.[tokenName]?.decimals ?? 18;
-          
-          if (tokenName === 'DAV') {
-            return { tokenName, numeric: 0, display: '-----' };
-          }
-          
-          if (tokenName === 'STATE') {
-            const result = await calculateStatePlsValue(balance);
-            return { tokenName, ...result };
-          }
-          
-          const numBalance = Number(balance);
-          if (!balance || numBalance <= 0) {
-            return { tokenName, numeric: 0, display: '0' };
-          }
-          
-          const result = await calculateAuctionTokenPlsValue(tokenName, balance, decimals);
-          return { tokenName, ...result };
-        });
-        
-        const batchResults = await Promise.all(batchPromises);
-        
-        for (const result of batchResults) {
-          results[result.tokenName] = result.display;
-          totalPls += result.numeric;
-        }
-        
-        // Micro-yield between batches to keep UI responsive (only 0ms - just yields event loop)
-        if (i + BATCH_SIZE < sortedTokens.length) {
-          await new Promise(resolve => setTimeout(resolve, 0));
-        }
+
+        const numBalance = Number(balance);
+        if (!balance || numBalance <= 0) return { tokenName, stateWei: 0n };
+
+        const stateWei = await calculateTokenStateWei(tokenName, balance, decimals);
+        return { tokenName, stateWei };
+      }));
+
+      for (const { tokenName, stateWei } of perToken) {
+        stateWeiByToken[tokenName] = stateWei;
+        if (tokenName !== 'DAV') totalStateWei += stateWei;
       }
       
       // Check if calculation was superseded or component unmounted
@@ -325,7 +278,43 @@ export function useBackgroundAmmCalculator(sortedTokens, tokenBalances, chainId,
         return;
       }
       
-      const formattedTotal = formatWithCommas(totalPls);
+      // Convert the aggregated STATE total into PLS once
+      let formattedTotal = '0';
+      let totalPlsWei = 0n;
+      try {
+        if (totalStateWei > 0n) {
+          const router = getRouter();
+          const { stateAddress, wplsAddress } = getTokensAddresses();
+          if (stateAddress && wplsAddress) {
+            const checksumState = toChecksumAddress(stateAddress);
+            const checksumWpls = toChecksumAddress(wplsAddress);
+            const path = [checksumState, checksumWpls];
+            const amounts = await router.getAmountsOut(totalStateWei, path);
+            totalPlsWei = amounts[amounts.length - 1];
+            formattedTotal = formatWeiToIntegerWithCommas(totalPlsWei);
+          }
+        }
+      } catch {
+        formattedTotal = '0';
+        totalPlsWei = 0n;
+      }
+
+      // Allocate per-token PLS proportionally to STATE contribution so row sum == total
+      const results = {};
+      for (const token of sortedTokens) {
+        const tokenName = token.tokenName;
+        if (tokenName === 'DAV') {
+          results[tokenName] = '-----';
+          continue;
+        }
+        const tokenStateWei = stateWeiByToken[tokenName] || 0n;
+        if (totalStateWei === 0n || totalPlsWei === 0n || tokenStateWei === 0n) {
+          results[tokenName] = '0';
+          continue;
+        }
+        const tokenPlsWei = (totalPlsWei * tokenStateWei) / totalStateWei;
+        results[tokenName] = formatWeiToDisplay(tokenPlsWei);
+      }
       
       setAmmValuesMap(results);
       setTotalSum(formattedTotal);
@@ -340,7 +329,7 @@ export function useBackgroundAmmCalculator(sortedTokens, tokenBalances, chainId,
         setIsCalculating(false);
       }
     }
-  }, [chainId, sortedTokens, tokenBalances, TOKENS, calculateAuctionTokenPlsValue, calculateStatePlsValue]);
+  }, [chainId, sortedTokens, tokenBalances, TOKENS, calculateTokenStateWei, getRouter, getTokensAddresses, parseStateWei, toChecksumAddress]);
   
   // Trigger calculation - runs immediately for speed
   const triggerCalculation = useCallback((force = false) => {

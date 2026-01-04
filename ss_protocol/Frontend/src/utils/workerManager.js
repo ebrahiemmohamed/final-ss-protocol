@@ -103,7 +103,7 @@ export function terminateWorker() {
  * Calculate AMM values using the worker
  * Returns a promise that resolves with { values, totalSum, timestamp }
  */
-export function calculateAmmValuesAsync(tokens, tokenBalances) {
+export function calculateAmmValuesAsync(tokens, tokenBalances, options) {
   return new Promise((resolve, reject) => {
     const w = getWorker();
     
@@ -133,6 +133,7 @@ export function calculateAmmValuesAsync(tokens, tokenBalances) {
       type: 'CALCULATE_AMM',
       tokens,
       tokenBalances,
+      options,
       requestId
     });
   });
